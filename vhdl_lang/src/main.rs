@@ -11,8 +11,9 @@ use std::iter::zip;
 use std::path::{Path, PathBuf};
 use vhdl_lang::ast::DesignFile;
 use vhdl_lang::{
-    Config, DesignHierarchyNode, Diagnostic, HierarchyKind, MessagePrinter, Project, Severity,
-    SeverityMap, Source, SrcPos, VHDLFormatter, VHDLParser, VHDLStandard,
+    Config, DataFlow, DesignHierarchyNode, Diagnostic, EndpointKind, HierarchyKind, MessagePrinter,
+    NetKind, PortDirection, Project, Severity, SeverityMap, Source, SrcPos, VHDLFormatter,
+    VHDLParser, VHDLStandard,
 };
 
 #[derive(Debug, clap::Args)]
@@ -66,6 +67,20 @@ struct Args {
     #[arg(long)]
     hierarchy_quiet: bool,
 
+    /// Print the data-flow graph (instances, ports, nets) for one
+    /// architecture of the given top entity. Same library-resolution
+    /// rules as `--hierarchy`. Requires `--config`.
+    #[arg(long, value_name = "[LIB.]ENTITY")]
+    dataflow: Option<String>,
+
+    /// Output format for `--dataflow`.
+    #[arg(long, value_enum, default_value_t = HierarchyFormat::Text)]
+    dataflow_format: HierarchyFormat,
+
+    /// Suppress diagnostics output when running `--dataflow`.
+    #[arg(long)]
+    dataflow_quiet: bool,
+
     #[clap(flatten)]
     group: Group,
 }
@@ -84,6 +99,19 @@ fn main() {
             &top,
             args.hierarchy_format,
             args.hierarchy_quiet,
+        );
+    } else if let Some(top) = args.dataflow.clone() {
+        let config_path = args.group.config.clone().unwrap_or_else(|| {
+            eprintln!("--dataflow requires --config");
+            std::process::exit(2);
+        });
+        run_dataflow(
+            &config_path,
+            args.num_threads,
+            args.libraries.as_ref(),
+            &top,
+            args.dataflow_format,
+            args.dataflow_quiet,
         );
     } else if let Some(config_path) = args.group.config {
         parse_and_analyze_project(&config_path, args.num_threads, args.libraries.as_ref());
@@ -265,6 +293,366 @@ fn resolve_default_library(project: &Project) -> Result<String, String> {
 
 fn is_standard_library(name: &str) -> bool {
     matches!(name, "std" | "ieee" | "vunit_lib" | "vunit_libs")
+}
+
+// --- Data flow CLI -----------------------------------------------------------
+
+fn run_dataflow(
+    config_path: &str,
+    num_threads: Option<usize>,
+    libraries: Option<&String>,
+    top: &str,
+    fmt: HierarchyFormat,
+    quiet: bool,
+) {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads.unwrap_or(0))
+        .build_global()
+        .ok();
+
+    let mut config = Config::default();
+    let mut msg_printer = MessagePrinter::default();
+    config.load_external_config(&mut msg_printer, libraries.cloned());
+    config.append(
+        &Config::read_file_path(Path::new(config_path)).expect("Failed to read config file"),
+        &mut msg_printer,
+    );
+
+    let severity_map = *config.severities();
+    let mut project = Project::from_config(config, &mut msg_printer);
+    let diagnostics = project.analyse();
+    if !quiet {
+        show_diagnostics(&diagnostics, &severity_map);
+    }
+
+    let (lib, ent) = match top.split_once('.') {
+        Some((l, e)) => (l.to_string(), e.to_string()),
+        None => match resolve_default_library(&project) {
+            Ok(l) => (l, top.to_string()),
+            Err(err) => {
+                eprintln!("dataflow error: {err}");
+                std::process::exit(1);
+            }
+        },
+    };
+
+    match project.data_flow(&lib, &ent) {
+        Ok(df) => {
+            let out = match fmt {
+                HierarchyFormat::Text => format_dataflow_text(&df),
+                HierarchyFormat::Json => format_dataflow_json(&df),
+            };
+            print!("{out}");
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("dataflow error: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn format_dataflow_text(df: &DataFlow) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let arch = df.architecture.as_deref().unwrap_or("?");
+    let _ = writeln!(out, "{}({})", df.entity_path, arch);
+    if let Some(pos) = df.entity_pos.as_ref() {
+        let _ = writeln!(out, "  declared at {}", format_pos(pos));
+    }
+    for note in &df.notes {
+        let _ = writeln!(out, "  # {note}");
+    }
+
+    if !df.external_ports.is_empty() {
+        let _ = writeln!(out, "\nexternal ports:");
+        for p in &df.external_ports {
+            let _ = writeln!(
+                out,
+                "  {:<24} {:<7}  {}",
+                p.name,
+                direction_str(p.direction),
+                p.type_repr
+            );
+        }
+    }
+
+    if !df.instances.is_empty() {
+        let _ = writeln!(out, "\ninstances:");
+        for inst in &df.instances {
+            let label = inst.label.as_deref().unwrap_or(inst.id.as_str());
+            let _ = writeln!(out, "  {} : {}", label, inst.entity_path);
+            if let Some(pos) = inst.instance_pos.as_ref() {
+                let _ = writeln!(out, "    @{}", format_pos(pos));
+            }
+            for n in &inst.notes {
+                let _ = writeln!(out, "    # {n}");
+            }
+            for p in &inst.ports {
+                let _ = writeln!(
+                    out,
+                    "    {:<24} {:<7}  {}",
+                    p.name,
+                    direction_str(p.direction),
+                    p.type_repr
+                );
+            }
+        }
+    }
+
+    if !df.processes.is_empty() {
+        let _ = writeln!(out, "\nprocesses:");
+        for proc in &df.processes {
+            let label = proc.label.as_deref().unwrap_or(proc.id.as_str());
+            let sens = match &proc.sensitivity {
+                vhdl_lang::Sensitivity::Names(names) if names.is_empty() => "(none)".into(),
+                vhdl_lang::Sensitivity::Names(names) => names.join(", "),
+                vhdl_lang::Sensitivity::All => "all".into(),
+                vhdl_lang::Sensitivity::Implicit => "implicit (wait)".into(),
+            };
+            let _ = writeln!(out, "  {label}");
+            if let Some(pos) = proc.source_pos.as_ref() {
+                let _ = writeln!(out, "    @{}", format_pos(pos));
+            }
+            let _ = writeln!(out, "    sensitivity: {sens}");
+            if let Some(clk) = &proc.clock_signal {
+                let _ = writeln!(out, "    clock: {clk}");
+            }
+            if let Some(rst) = &proc.reset_signal {
+                let _ = writeln!(out, "    reset: {rst}");
+            }
+            if !proc.reads.is_empty() {
+                let _ = writeln!(out, "    reads:  {}", proc.reads.join(", "));
+            }
+            if !proc.writes.is_empty() {
+                let _ = writeln!(out, "    writes: {}", proc.writes.join(", "));
+            }
+        }
+    }
+
+    if !df.nets.is_empty() {
+        let _ = writeln!(out, "\nnets:");
+        for net in &df.nets {
+            let kind = match net.kind {
+                NetKind::Signal => "signal",
+                NetKind::ParentPort => "port",
+                NetKind::Opaque => "expr",
+            };
+            let _ = writeln!(out, "  [{kind}] {} ({} endpoints)", net.name, net.endpoints.len());
+            for ep in &net.endpoints {
+                let target = match ep.kind {
+                    EndpointKind::External => "<external>".to_string(),
+                    EndpointKind::Instance | EndpointKind::Process => {
+                        ep.cell_id.clone().unwrap_or_default()
+                    }
+                };
+                let _ = writeln!(out, "    {}.{}  ({})", target, ep.port, direction_str(ep.direction));
+            }
+        }
+    }
+    out
+}
+
+fn direction_str(d: PortDirection) -> &'static str {
+    match d {
+        PortDirection::In => "in",
+        PortDirection::Out => "out",
+        PortDirection::Inout => "inout",
+        PortDirection::Buffer => "buffer",
+        PortDirection::Linkage => "linkage",
+        PortDirection::Unknown => "?",
+    }
+}
+
+fn format_dataflow_json(df: &DataFlow) -> String {
+    let ser = ser_dataflow::SerDataFlow::from(df);
+    let mut s = serde_json::to_string_pretty(&ser).expect("serialize dataflow");
+    s.push('\n');
+    s
+}
+
+mod ser_dataflow {
+    use super::{format_pos, DataFlow, EndpointKind, NetKind, PortDirection};
+    use serde::Serialize;
+    use vhdl_lang::{Endpoint, InstanceInfo, NetInfo, PortInfo, ProcessInfo, Sensitivity};
+
+    #[derive(Serialize)]
+    pub struct SerDataFlow<'a> {
+        entity: &'a str,
+        architecture: Option<&'a str>,
+        entity_pos: Option<String>,
+        external_ports: Vec<SerPort<'a>>,
+        instances: Vec<SerInstance<'a>>,
+        processes: Vec<SerProcess<'a>>,
+        nets: Vec<SerNet<'a>>,
+        notes: &'a [String],
+    }
+
+    impl<'a> From<&'a DataFlow> for SerDataFlow<'a> {
+        fn from(df: &'a DataFlow) -> Self {
+            SerDataFlow {
+                entity: &df.entity_path,
+                architecture: df.architecture.as_deref(),
+                entity_pos: df.entity_pos.as_ref().map(format_pos),
+                external_ports: df.external_ports.iter().map(SerPort::from).collect(),
+                instances: df.instances.iter().map(SerInstance::from).collect(),
+                processes: df.processes.iter().map(SerProcess::from).collect(),
+                nets: df.nets.iter().map(SerNet::from).collect(),
+                notes: &df.notes,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct SerProcess<'a> {
+        id: &'a str,
+        label: Option<&'a str>,
+        source_pos: Option<String>,
+        sensitivity: SerSensitivity<'a>,
+        clock_signal: Option<&'a str>,
+        reset_signal: Option<&'a str>,
+        reads: &'a [String],
+        writes: &'a [String],
+        notes: &'a [String],
+    }
+
+    impl<'a> From<&'a ProcessInfo> for SerProcess<'a> {
+        fn from(p: &'a ProcessInfo) -> Self {
+            SerProcess {
+                id: &p.id,
+                label: p.label.as_deref(),
+                source_pos: p.source_pos.as_ref().map(format_pos),
+                sensitivity: match &p.sensitivity {
+                    Sensitivity::Names(names) => SerSensitivity {
+                        kind: "names",
+                        names: Some(names),
+                    },
+                    Sensitivity::All => SerSensitivity {
+                        kind: "all",
+                        names: None,
+                    },
+                    Sensitivity::Implicit => SerSensitivity {
+                        kind: "implicit",
+                        names: None,
+                    },
+                },
+                clock_signal: p.clock_signal.as_deref(),
+                reset_signal: p.reset_signal.as_deref(),
+                reads: &p.reads,
+                writes: &p.writes,
+                notes: &p.notes,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct SerSensitivity<'a> {
+        kind: &'static str,
+        names: Option<&'a [String]>,
+    }
+
+    #[derive(Serialize)]
+    struct SerPort<'a> {
+        name: &'a str,
+        direction: &'static str,
+        type_repr: &'a str,
+        decl_pos: Option<String>,
+    }
+
+    impl<'a> From<&'a PortInfo> for SerPort<'a> {
+        fn from(p: &'a PortInfo) -> Self {
+            SerPort {
+                name: &p.name,
+                direction: dir(p.direction),
+                type_repr: &p.type_repr,
+                decl_pos: p.decl_pos.as_ref().map(format_pos),
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct SerInstance<'a> {
+        id: &'a str,
+        label: Option<&'a str>,
+        entity: &'a str,
+        instance_pos: Option<String>,
+        entity_pos: Option<String>,
+        ports: Vec<SerPort<'a>>,
+        notes: &'a [String],
+    }
+
+    impl<'a> From<&'a InstanceInfo> for SerInstance<'a> {
+        fn from(i: &'a InstanceInfo) -> Self {
+            SerInstance {
+                id: &i.id,
+                label: i.label.as_deref(),
+                entity: &i.entity_path,
+                instance_pos: i.instance_pos.as_ref().map(format_pos),
+                entity_pos: i.entity_pos.as_ref().map(format_pos),
+                ports: i.ports.iter().map(SerPort::from).collect(),
+                notes: &i.notes,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct SerNet<'a> {
+        name: &'a str,
+        kind: &'static str,
+        endpoints: Vec<SerEndpoint<'a>>,
+    }
+
+    impl<'a> From<&'a NetInfo> for SerNet<'a> {
+        fn from(n: &'a NetInfo) -> Self {
+            SerNet {
+                name: &n.name,
+                kind: net_kind(n.kind),
+                endpoints: n.endpoints.iter().map(SerEndpoint::from).collect(),
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct SerEndpoint<'a> {
+        kind: &'static str,
+        cell_id: Option<&'a str>,
+        port: &'a str,
+        direction: &'static str,
+    }
+
+    impl<'a> From<&'a Endpoint> for SerEndpoint<'a> {
+        fn from(e: &'a Endpoint) -> Self {
+            SerEndpoint {
+                kind: match e.kind {
+                    EndpointKind::External => "external",
+                    EndpointKind::Instance => "instance",
+                    EndpointKind::Process => "process",
+                },
+                cell_id: e.cell_id.as_deref(),
+                port: &e.port,
+                direction: dir(e.direction),
+            }
+        }
+    }
+
+    fn dir(d: PortDirection) -> &'static str {
+        match d {
+            PortDirection::In => "in",
+            PortDirection::Out => "out",
+            PortDirection::Inout => "inout",
+            PortDirection::Buffer => "buffer",
+            PortDirection::Linkage => "linkage",
+            PortDirection::Unknown => "unknown",
+        }
+    }
+
+    fn net_kind(k: NetKind) -> &'static str {
+        match k {
+            NetKind::Signal => "signal",
+            NetKind::ParentPort => "parentPort",
+            NetKind::Opaque => "opaque",
+        }
+    }
 }
 
 // --- Hierarchy text & JSON rendering -----------------------------------------

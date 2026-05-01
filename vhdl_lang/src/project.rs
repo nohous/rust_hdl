@@ -380,6 +380,16 @@ impl Project {
         crate::list_top_candidates(&self.root)
     }
 
+    /// Compute the data-flow graph (instances, ports, nets) for one
+    /// architecture of `library.entity`.
+    pub fn data_flow(
+        &self,
+        library_name: &str,
+        entity_name: &str,
+    ) -> Result<crate::DataFlow, crate::HierarchyError> {
+        crate::compute_data_flow(&self.root, library_name, entity_name)
+    }
+
     /// Sorted list of library names known to the project.
     pub fn library_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self

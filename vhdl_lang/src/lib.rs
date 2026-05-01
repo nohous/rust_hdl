@@ -24,6 +24,7 @@ mod project;
 mod syntax;
 
 mod completion;
+mod dataflow;
 mod formatting;
 mod hierarchy;
 mod standard;
@@ -47,6 +48,10 @@ pub use crate::syntax::{
 };
 
 pub use completion::{list_completion_options, CompletionItem};
+pub use dataflow::{
+    compute_data_flow, DataFlow, Endpoint, EndpointKind, InstanceInfo, NetInfo, NetKind,
+    PortDirection, PortInfo, ProcessInfo, Sensitivity,
+};
 pub use hierarchy::{
     compute_design_hierarchy, list_top_candidates, DesignHierarchyNode, HierarchyError,
     HierarchyKind, TopCandidate,
