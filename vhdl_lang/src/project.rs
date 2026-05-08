@@ -381,13 +381,29 @@ impl Project {
     }
 
     /// Compute the data-flow graph (instances, ports, nets) for one
-    /// architecture of `library.entity`.
+    /// architecture of `library.entity`. Uses heuristic clock-pin
+    /// detection (port name contains `clk`/`clock`) for instance
+    /// boundaries; for semantic clock detection use
+    /// [`Project::data_flow_recursive`].
     pub fn data_flow(
         &self,
         library_name: &str,
         entity_name: &str,
     ) -> Result<crate::DataFlow, crate::HierarchyError> {
         crate::compute_data_flow(&self.root, library_name, entity_name)
+    }
+
+    /// Same as [`Project::data_flow`] but recursively analyses each
+    /// reachable leaf entity to (1) detect instance clock pins
+    /// semantically (via processes' `rising_edge`/`falling_edge`
+    /// patterns) instead of by port name, and (2) propagate
+    /// per-output-port clock domains across multi-clock leaves.
+    pub fn data_flow_recursive(
+        &self,
+        library_name: &str,
+        entity_name: &str,
+    ) -> Result<crate::DataFlow, crate::HierarchyError> {
+        crate::compute_data_flow_recursive(&self.root, library_name, entity_name)
     }
 
     /// Sorted list of library names known to the project.

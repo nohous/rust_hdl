@@ -91,6 +91,13 @@ pub struct InstanceInfo {
     pub entity_pos: Option<SrcPos>,
     pub ports: Vec<PortInfo>,
     pub notes: Vec<String>,
+    /// Architecture-level signals connected to this instance's
+    /// clock-named input ports (heuristic: port name contains
+    /// `clk`/`clock`). Empty for combinational leaves; one entry for
+    /// most synchronous leaves; multiple entries flag a CDC bridge
+    /// whose internal domain mapping cannot be inferred without
+    /// analyzing the leaf body.
+    pub clocks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,6 +163,16 @@ pub struct NetInfo {
     pub name: String,
     pub kind: NetKind,
     pub endpoints: Vec<Endpoint>,
+    /// Clock signal that registers this net's driver. `Some(s)` means
+    /// every value on this net is registered against signal `s`
+    /// somewhere upstream. `None` means combinational, externally
+    /// driven, multi-driver, or driven by a multi-clock instance whose
+    /// per-output domain cannot be inferred from the parent
+    /// architecture alone.
+    pub clock_domain: Option<String>,
+    /// True when at least one sink consumes this net under a different
+    /// clock than `clock_domain` - i.e. a clock-domain crossing.
+    pub is_cdc: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +413,7 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                 })
                 .unwrap_or_default(),
             notes: Vec::new(),
+            clocks: Vec::new(),
         };
 
         if bound_entity.is_none() {
@@ -422,6 +440,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                             name: ident_string(root.get_ent(actual_id)),
                             kind: NetKind::Signal,
                             endpoints: Vec::new(),
+                            clock_domain: None,
+                            is_cdc: false,
                         },
                         Endpoint {
                             kind: EndpointKind::Instance,
@@ -442,6 +462,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                             name: ident_string(root.get_ent(actual_id)),
                             kind: NetKind::ParentPort,
                             endpoints: Vec::new(),
+                            clock_domain: None,
+                            is_cdc: false,
                         },
                         Endpoint {
                             kind: EndpointKind::Instance,
@@ -467,6 +489,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                             direction,
                             source_pos: Some(raw.instance_pos.clone()),
                         }],
+                        clock_domain: None,
+                        is_cdc: false,
                     });
                 }
             }
@@ -577,6 +601,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                             name: sig.clone(),
                             kind: net_kind,
                             endpoints: Vec::new(),
+                            clock_domain: None,
+                            is_cdc: false,
                         },
                         Endpoint {
                             kind: EndpointKind::Process,
@@ -603,6 +629,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                             name: sig.clone(),
                             kind: net_kind,
                             endpoints: Vec::new(),
+                            clock_domain: None,
+                            is_cdc: false,
                         },
                         Endpoint {
                             kind: EndpointKind::Process,
@@ -627,7 +655,218 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    attribute_clock_domains(&mut df, &HeuristicClockPins);
+
     df
+}
+
+/// Heuristic: a port name belongs to a clock if it contains the
+/// substring "clk" or "clock" (case-insensitive). Catches `clk`,
+/// `aclk`, `i_clk`, `m_axis_aclk`, `clock_in`, etc. False positives
+/// in real designs are rare in practice.
+pub(crate) fn looks_like_clock_port(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("clk") || lower.contains("clock")
+}
+
+/// Walks the data-flow graph and attributes each net to a clock domain
+/// where possible, then flags clock-domain crossings. Pure
+/// post-processing - does not touch the AST.
+///
+/// Rules:
+/// * For each instance, the connected nets on its clock-named input
+///   ports are recorded as the instance's clocks.
+/// * A net's domain is the clock of its (single) driver:
+///   - process driver -> the process's `clock_signal`
+///   - instance driver -> the (single) clock of that instance, when
+///     unambiguous; multi-clock instances leave their outputs
+///     unattributed (we'd need leaf analysis to know which output is
+///     in which domain).
+/// * A net is CDC when its domain is known and at least one sink
+///   reads it under a different clock.
+/// Resolves which input ports of an instance's bound entity are clocks.
+///
+/// The default implementation is a name heuristic (`*clk*` / `*clock*`).
+/// The recursive variant of `compute_data_flow` overrides this with
+/// semantic detection: it analyses each leaf entity's processes and
+/// uses whatever names appear inside `rising_edge` / `falling_edge`
+/// patterns. With a real predicate in hand we can stop guessing.
+pub trait ClockPinResolver {
+    /// Return true if `port_name` (an input port of the entity bound
+    /// by `inst_id`) should be treated as a clock input.
+    fn is_clock_pin(&self, inst_id: &str, port_name: &str) -> bool;
+}
+
+/// Fallback predicate used when leaf analysis isn't available
+/// (e.g. external IP with no source, recursion limit).
+pub struct HeuristicClockPins;
+
+impl ClockPinResolver for HeuristicClockPins {
+    fn is_clock_pin(&self, _inst_id: &str, port_name: &str) -> bool {
+        looks_like_clock_port(port_name)
+    }
+}
+
+fn attribute_clock_domains(df: &mut DataFlow, resolver: &dyn ClockPinResolver) {
+    reattribute_clock_domains(df, resolver);
+    recompute_cdc_flags(df, resolver);
+}
+
+/// First-pass attribution: figures out each net's clock domain (when
+/// determinable) using process drivers and single-clock instances.
+/// Splits out so the recursive analysis can rerun it after replacing
+/// the heuristic resolver with a semantic one.
+pub(crate) fn reattribute_clock_domains(df: &mut DataFlow, resolver: &dyn ClockPinResolver) {
+    // process id -> clock signal name
+    let proc_clock: HashMap<String, String> = df
+        .processes
+        .iter()
+        .filter_map(|p| {
+            p.clock_signal
+                .as_ref()
+                .map(|c| (p.id.clone(), c.clone()))
+        })
+        .collect();
+
+    // For each instance, find clock-pin nets via the resolver.
+    //   instance id -> sorted, deduped list of net names connected to
+    //                  that instance's clock-typed input ports.
+    let mut inst_clocks: HashMap<String, Vec<String>> = HashMap::new();
+    for inst in &df.instances {
+        let mut clks: Vec<String> = Vec::new();
+        for port in &inst.ports {
+            if !matches!(port.direction, PortDirection::In) {
+                continue;
+            }
+            if !resolver.is_clock_pin(&inst.id, &port.name) {
+                continue;
+            }
+            // Find net connected to (inst.id, port.name).
+            for net in &df.nets {
+                if net.endpoints.iter().any(|ep| {
+                    ep.kind == EndpointKind::Instance
+                        && ep.cell_id.as_deref() == Some(inst.id.as_str())
+                        && ep.port == port.name
+                }) {
+                    clks.push(net.name.clone());
+                    break;
+                }
+            }
+        }
+        clks.sort();
+        clks.dedup();
+        inst_clocks.insert(inst.id.clone(), clks);
+    }
+    // Mirror onto the public InstanceInfo for renderers.
+    for inst in &mut df.instances {
+        if let Some(clks) = inst_clocks.get(&inst.id) {
+            inst.clocks = clks.clone();
+        }
+    }
+
+    // First pass: assign domain by inspecting drivers.
+    for net in &mut df.nets {
+        let mut driver_domains: HashSet<String> = HashSet::new();
+        for ep in &net.endpoints {
+            let drives = matches!(
+                ep.direction,
+                PortDirection::Out | PortDirection::Inout | PortDirection::Buffer
+            );
+            if !drives {
+                continue;
+            }
+            match ep.kind {
+                EndpointKind::Process => {
+                    if let Some(cell) = ep.cell_id.as_deref() {
+                        if let Some(clk) = proc_clock.get(cell) {
+                            driver_domains.insert(clk.clone());
+                        }
+                    }
+                }
+                EndpointKind::Instance => {
+                    if let Some(cell) = ep.cell_id.as_deref() {
+                        if let Some(clks) = inst_clocks.get(cell) {
+                            if clks.len() == 1 {
+                                driver_domains.insert(clks[0].clone());
+                            }
+                            // multi-clock instance: per-output mapping
+                            // unknown without leaf analysis; leave
+                            // unattributed (the recursive pass fills
+                            // these in afterwards).
+                        }
+                    }
+                }
+                EndpointKind::External => {
+                    // External input drives the net; domain is whatever
+                    // is upstream of the parent - unknown here.
+                }
+            }
+        }
+        if driver_domains.len() == 1 {
+            net.clock_domain = driver_domains.into_iter().next();
+        }
+    }
+}
+
+/// Second-pass attribution: flags nets where a sink reads under a
+/// different clock from the driver. Split out so the recursive pass
+/// can rerun it after extra domains have been filled in via leaf
+/// output propagation.
+pub(crate) fn recompute_cdc_flags(df: &mut DataFlow, resolver: &dyn ClockPinResolver) {
+    let proc_clock: HashMap<String, String> = df
+        .processes
+        .iter()
+        .filter_map(|p| {
+            p.clock_signal
+                .as_ref()
+                .map(|c| (p.id.clone(), c.clone()))
+        })
+        .collect();
+    // Reuse already-populated inst.clocks (set by
+    // reattribute_clock_domains).
+    let inst_clocks: HashMap<&str, &Vec<String>> = df
+        .instances
+        .iter()
+        .map(|i| (i.id.as_str(), &i.clocks))
+        .collect();
+
+    for net in &mut df.nets {
+        net.is_cdc = false;
+        let Some(domain) = net.clock_domain.clone() else {
+            continue;
+        };
+        for ep in &net.endpoints {
+            if !matches!(ep.direction, PortDirection::In) {
+                continue;
+            }
+            match ep.kind {
+                EndpointKind::Process => {
+                    if let Some(cell) = ep.cell_id.as_deref() {
+                        if let Some(sink_clk) = proc_clock.get(cell) {
+                            if sink_clk != &domain {
+                                net.is_cdc = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                EndpointKind::Instance => {
+                    if let Some(cell) = ep.cell_id.as_deref() {
+                        if resolver.is_clock_pin(cell, &ep.port) {
+                            continue;
+                        }
+                        if let Some(clks) = inst_clocks.get(cell) {
+                            if clks.len() == 1 && clks[0] != domain {
+                                net.is_cdc = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                EndpointKind::External => {}
+            }
+        }
+    }
 }
 
 fn net_kind_order(k: NetKind) -> u8 {
@@ -835,13 +1074,10 @@ fn build_instance_assoc(
 fn collect_associations(ctx: &dyn TokenAccess, map: &MapAspect) -> Vec<RawAssociation> {
     let mut out = Vec::with_capacity(map.list.items.len());
     for (i, el) in map.list.items.iter().enumerate() {
-        let formal_name = el.formal.as_ref().and_then(|name| match &name.item {
-            Name::Designator(desi) => match &desi.item {
-                Designator::Identifier(s) => Some(s.name_utf8()),
-                _ => None,
-            },
-            _ => None,
-        });
+        let formal_name = el
+            .formal
+            .as_ref()
+            .and_then(|name| extract_formal_base(&name.item));
         let (actual_id, actual_text) = match &el.actual.item {
             crate::ast::ActualPart::Open => (None, Some("open".into())),
             crate::ast::ActualPart::Expression(expr) => resolve_actual_expression(ctx, expr),
@@ -854,6 +1090,25 @@ fn collect_associations(ctx: &dyn TokenAccess, map: &MapAspect) -> Vec<RawAssoci
         });
     }
     out
+}
+
+/// The base port identifier of a (possibly indexed / sliced /
+/// record-selected) formal. Slice formals like `i_vec(127 downto 96)`
+/// resolve to `i_vec`; record-element formals like `axi_lite.awvalid`
+/// resolve to `axi_lite`. Returns `None` for fully opaque formals
+/// (attribute references, external names).
+fn extract_formal_base(name: &Name) -> Option<String> {
+    match name {
+        Name::Designator(desi) => match &desi.item {
+            Designator::Identifier(s) => Some(s.name_utf8()),
+            _ => None,
+        },
+        Name::Slice(prefix, _) => extract_formal_base(&prefix.item),
+        Name::CallOrIndexed(c) => extract_formal_base(&c.name.item),
+        Name::Selected(prefix, _) => extract_formal_base(&prefix.item),
+        Name::SelectedAll(prefix) => extract_formal_base(&prefix.item),
+        Name::Attribute(_) | Name::External(_) => None,
+    }
 }
 
 fn resolve_actual_expression(

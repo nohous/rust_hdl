@@ -286,6 +286,36 @@ impl ConnectionRpcChannel {
             return;
         }
 
+        // Custom request: vhdl/dataFlow
+        if request.method == "vhdl/dataFlow" {
+            use crate::vhdl_server::dataflow::DataFlowParams;
+            let id = request.id.clone();
+            let params: DataFlowParams = match serde_json::from_value(request.params) {
+                Ok(p) => p,
+                Err(err) => {
+                    self.send_response(lsp_server::Response::new_err(
+                        id,
+                        lsp_server::ErrorCode::InvalidParams as i32,
+                        format!("Invalid params for vhdl/dataFlow: {err}"),
+                    ));
+                    return;
+                }
+            };
+            match server.data_flow(&params) {
+                Ok(payload) => {
+                    self.send_response(lsp_server::Response::new_ok(id, payload));
+                }
+                Err(err) => {
+                    self.send_response(lsp_server::Response::new_err(
+                        id,
+                        lsp_server::ErrorCode::InvalidRequest as i32,
+                        format!("{err}"),
+                    ));
+                }
+            }
+            return;
+        }
+
         debug!("Unhandled request: {request:?}");
         self.send_response(lsp_server::Response::new_err(
             request.id,

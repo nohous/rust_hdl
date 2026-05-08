@@ -25,6 +25,8 @@ mod syntax;
 
 mod completion;
 mod dataflow;
+mod dataflow_recursive;
+mod dataflow_yosys;
 mod formatting;
 mod hierarchy;
 mod standard;
@@ -49,9 +51,11 @@ pub use crate::syntax::{
 
 pub use completion::{list_completion_options, CompletionItem};
 pub use dataflow::{
-    compute_data_flow, DataFlow, Endpoint, EndpointKind, InstanceInfo, NetInfo, NetKind,
-    PortDirection, PortInfo, ProcessInfo, Sensitivity,
+    compute_data_flow, ClockPinResolver, DataFlow, Endpoint, EndpointKind, HeuristicClockPins,
+    InstanceInfo, NetInfo, NetKind, PortDirection, PortInfo, ProcessInfo, Sensitivity,
 };
+pub use dataflow_recursive::compute_data_flow_recursive;
+pub use dataflow_yosys::{format_yosys, format_yosys_string};
 pub use hierarchy::{
     compute_design_hierarchy, list_top_candidates, DesignHierarchyNode, HierarchyError,
     HierarchyKind, TopCandidate,

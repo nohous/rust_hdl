@@ -34,6 +34,9 @@ pub struct Group {
 enum HierarchyFormat {
     Text,
     Json,
+    /// Yosys-style JSON, the format consumed by netlistsvg. Only valid
+    /// for `--dataflow`.
+    Yosys,
 }
 
 /// Run vhdl analysis
@@ -248,6 +251,10 @@ fn run_hierarchy(
             let out = match fmt {
                 HierarchyFormat::Text => format_hierarchy_text(&node),
                 HierarchyFormat::Json => format_hierarchy_json(&node),
+                HierarchyFormat::Yosys => {
+                    eprintln!("yosys format is only valid for --dataflow");
+                    std::process::exit(1);
+                }
             };
             print!("{out}");
             std::process::exit(0);
@@ -336,11 +343,12 @@ fn run_dataflow(
         },
     };
 
-    match project.data_flow(&lib, &ent) {
+    match project.data_flow_recursive(&lib, &ent) {
         Ok(df) => {
             let out = match fmt {
                 HierarchyFormat::Text => format_dataflow_text(&df),
                 HierarchyFormat::Json => format_dataflow_json(&df),
+                HierarchyFormat::Yosys => format_dataflow_yosys(&df),
             };
             print!("{out}");
             std::process::exit(0);
@@ -384,6 +392,14 @@ fn format_dataflow_text(df: &DataFlow) -> String {
             let _ = writeln!(out, "  {} : {}", label, inst.entity_path);
             if let Some(pos) = inst.instance_pos.as_ref() {
                 let _ = writeln!(out, "    @{}", format_pos(pos));
+            }
+            if !inst.clocks.is_empty() {
+                let tag = if inst.clocks.len() > 1 {
+                    "clocks (multi-domain)"
+                } else {
+                    "clock"
+                };
+                let _ = writeln!(out, "    {tag}: {}", inst.clocks.join(", "));
             }
             for n in &inst.notes {
                 let _ = writeln!(out, "    # {n}");
@@ -438,7 +454,20 @@ fn format_dataflow_text(df: &DataFlow) -> String {
                 NetKind::ParentPort => "port",
                 NetKind::Opaque => "expr",
             };
-            let _ = writeln!(out, "  [{kind}] {} ({} endpoints)", net.name, net.endpoints.len());
+            let mut tags = String::new();
+            if let Some(domain) = &net.clock_domain {
+                tags.push_str(" @");
+                tags.push_str(domain);
+            }
+            if net.is_cdc {
+                tags.push_str(" [CDC]");
+            }
+            let _ = writeln!(
+                out,
+                "  [{kind}] {} ({} endpoints){tags}",
+                net.name,
+                net.endpoints.len()
+            );
             for ep in &net.endpoints {
                 let target = match ep.kind {
                     EndpointKind::External => "<external>".to_string(),
@@ -470,6 +499,11 @@ fn format_dataflow_json(df: &DataFlow) -> String {
     s.push('\n');
     s
 }
+
+fn format_dataflow_yosys(df: &DataFlow) -> String {
+    vhdl_lang::format_yosys_string(df)
+}
+
 
 mod ser_dataflow {
     use super::{format_pos, DataFlow, EndpointKind, NetKind, PortDirection};
@@ -579,6 +613,7 @@ mod ser_dataflow {
         entity_pos: Option<String>,
         ports: Vec<SerPort<'a>>,
         notes: &'a [String],
+        clocks: &'a [String],
     }
 
     impl<'a> From<&'a InstanceInfo> for SerInstance<'a> {
@@ -591,6 +626,7 @@ mod ser_dataflow {
                 entity_pos: i.entity_pos.as_ref().map(format_pos),
                 ports: i.ports.iter().map(SerPort::from).collect(),
                 notes: &i.notes,
+                clocks: &i.clocks,
             }
         }
     }
@@ -600,6 +636,8 @@ mod ser_dataflow {
         name: &'a str,
         kind: &'static str,
         endpoints: Vec<SerEndpoint<'a>>,
+        clock_domain: Option<&'a str>,
+        is_cdc: bool,
     }
 
     impl<'a> From<&'a NetInfo> for SerNet<'a> {
@@ -608,6 +646,8 @@ mod ser_dataflow {
                 name: &n.name,
                 kind: net_kind(n.kind),
                 endpoints: n.endpoints.iter().map(SerEndpoint::from).collect(),
+                clock_domain: n.clock_domain.as_deref(),
+                is_cdc: n.is_cdc,
             }
         }
     }

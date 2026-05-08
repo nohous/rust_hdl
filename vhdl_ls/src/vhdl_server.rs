@@ -5,6 +5,7 @@
 // Copyright (c) 2018, Olof Kraigher olof.kraigher@gmail.com
 
 mod completion;
+pub(crate) mod dataflow;
 mod diagnostics;
 pub(crate) mod hierarchy;
 mod lifecycle;
