@@ -44,8 +44,40 @@ use crate::named_entity::{
 };
 use crate::syntax::{HasTokenSpan, TokenAccess};
 use crate::SrcPos;
+use serde::{Serialize, Serializer};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serializes a source position as an LSP-style range: file path plus
+/// 0-based start and end line / character.
+fn serialize_pos<S: Serializer>(pos: &Option<SrcPos>, s: S) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Point {
+        line: u32,
+        character: u32,
+    }
+    #[derive(Serialize)]
+    struct Range<'a> {
+        file: std::borrow::Cow<'a, str>,
+        start: Point,
+        end: Point,
+    }
+
+    pos.as_ref()
+        .map(|p| Range {
+            file: p.file_name().to_string_lossy(),
+            start: Point {
+                line: p.start().line,
+                character: p.start().character,
+            },
+            end: Point {
+                line: p.end().line,
+                character: p.end().character,
+            },
+        })
+        .serialize(s)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PortDirection {
     In,
     Out,
@@ -69,16 +101,17 @@ impl PortDirection {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PortInfo {
     pub name: String,
     pub direction: PortDirection,
     /// Best-effort textual rendering of the type for display only.
     pub type_repr: String,
+    #[serde(serialize_with = "serialize_pos")]
     pub decl_pos: Option<SrcPos>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InstanceInfo {
     /// Stable id within the data-flow graph (the instance label, or
     /// `inst_<n>` for unlabeled ones - which are not legal VHDL but can
@@ -87,7 +120,13 @@ pub struct InstanceInfo {
     pub label: Option<String>,
     /// `library.entity` for the bound entity.
     pub entity_path: String,
+    /// Name of the component declaration the instance is bound to when
+    /// no entity implements it (vendor primitives, black boxes). Ports
+    /// and `entity_pos` then come from the component declaration.
+    pub component: Option<String>,
+    #[serde(serialize_with = "serialize_pos")]
     pub instance_pos: Option<SrcPos>,
+    #[serde(serialize_with = "serialize_pos")]
     pub entity_pos: Option<SrcPos>,
     pub ports: Vec<PortInfo>,
     pub notes: Vec<String>,
@@ -100,7 +139,8 @@ pub struct InstanceInfo {
     pub clocks: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EndpointKind {
     /// A port of the parent (top-of-graph) entity.
     External,
@@ -110,7 +150,7 @@ pub enum EndpointKind {
     Process,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Endpoint {
     pub kind: EndpointKind,
     /// For `Instance`: the instance's stable id. For `Process`: the
@@ -121,13 +161,15 @@ pub struct Endpoint {
     pub port: String,
     /// Direction of the signal flow at this endpoint, when known.
     pub direction: PortDirection,
+    #[serde(serialize_with = "serialize_pos")]
     pub source_pos: Option<SrcPos>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessInfo {
     pub id: String,
     pub label: Option<String>,
+    #[serde(serialize_with = "serialize_pos")]
     pub source_pos: Option<SrcPos>,
     /// What the process listens to.
     pub sensitivity: Sensitivity,
@@ -146,7 +188,8 @@ pub struct ProcessInfo {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Sensitivity {
     /// Explicit sensitivity list.
     Names(Vec<String>),
@@ -156,7 +199,7 @@ pub enum Sensitivity {
     Implicit,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NetInfo {
     /// Underlying signal name, parent port name, or `<expr>` when the
     /// actual expression was not a single resolved name.
@@ -175,7 +218,8 @@ pub struct NetInfo {
     pub is_cdc: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetKind {
     /// A net carried by an architecture-level signal.
     Signal,
@@ -186,10 +230,11 @@ pub enum NetKind {
     Opaque,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DataFlow {
     pub entity_path: String,
     pub architecture: Option<String>,
+    #[serde(serialize_with = "serialize_pos")]
     pub entity_pos: Option<SrcPos>,
     pub external_ports: Vec<PortInfo>,
     pub instances: Vec<InstanceInfo>,
@@ -254,11 +299,7 @@ fn known_entities(root: &DesignRoot, library: &Library) -> Vec<String> {
     names
 }
 
-fn find_entity<'a>(
-    root: &'a DesignRoot,
-    library: &Library,
-    entity: &Symbol,
-) -> Option<EntRef<'a>> {
+fn find_entity<'a>(root: &'a DesignRoot, library: &Library, entity: &Symbol) -> Option<EntRef<'a>> {
     for locked in library.units() {
         let data = locked.unit.expect_analyzed();
         let AnyDesignUnit::Primary(ref primary) = *data.deref() else {
@@ -376,7 +417,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
 
         // Resolve the bound entity; for components, follow default
         // binding to the entity (mirrors the hierarchy walker).
-        let bound_entity = match raw.target_id.and_then(|id| Some(root.get_ent(id))) {
+        let target = raw.target_id.map(|id| root.get_ent(id));
+        let bound_entity = match target {
             Some(ent) => match ent.kind() {
                 AnyEntKind::Design(Design::Entity(..)) => Some(ent),
                 AnyEntKind::Component(_) => root
@@ -387,6 +429,8 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
             },
             None => None,
         };
+        let component = target
+            .filter(|e| bound_entity.is_none() && matches!(e.kind(), AnyEntKind::Component(_)));
 
         let mut info = InstanceInfo {
             id: id.clone(),
@@ -402,13 +446,16 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                     )
                 })
                 .unwrap_or_else(|| "<unresolved>".into()),
+            component: component.map(ident_string),
             instance_pos: Some(raw.instance_pos.clone()),
-            entity_pos: bound_entity.and_then(|e| e.decl_pos().cloned()),
+            entity_pos: bound_entity
+                .or(component)
+                .and_then(|e| e.decl_pos().cloned()),
             ports: bound_entity
+                .or(component)
                 .map(|e| match e.kind() {
-                    AnyEntKind::Design(Design::Entity(_, region)) => {
-                        collect_ports_from_region(region)
-                    }
+                    AnyEntKind::Design(Design::Entity(_, region))
+                    | AnyEntKind::Component(region) => collect_ports_from_region(region),
                     _ => Vec::new(),
                 })
                 .unwrap_or_default(),
@@ -477,10 +524,7 @@ fn extract<'a>(root: &'a DesignRoot, library: &Library, entity: EntRef<'a>) -> D
                 _ => {
                     let direction = port_direction(&info.ports, &formal_name);
                     df.nets.push(NetInfo {
-                        name: assoc
-                            .actual_text
-                            .clone()
-                            .unwrap_or_else(|| "<expr>".into()),
+                        name: assoc.actual_text.clone().unwrap_or_else(|| "<expr>".into()),
                         kind: NetKind::Opaque,
                         endpoints: vec![Endpoint {
                             kind: EndpointKind::Instance,
@@ -721,11 +765,7 @@ pub(crate) fn reattribute_clock_domains(df: &mut DataFlow, resolver: &dyn ClockP
     let proc_clock: HashMap<String, String> = df
         .processes
         .iter()
-        .filter_map(|p| {
-            p.clock_signal
-                .as_ref()
-                .map(|c| (p.id.clone(), c.clone()))
-        })
+        .filter_map(|p| p.clock_signal.as_ref().map(|c| (p.id.clone(), c.clone())))
         .collect();
 
     // For each instance, find clock-pin nets via the resolver.
@@ -816,11 +856,7 @@ pub(crate) fn recompute_cdc_flags(df: &mut DataFlow, resolver: &dyn ClockPinReso
     let proc_clock: HashMap<String, String> = df
         .processes
         .iter()
-        .filter_map(|p| {
-            p.clock_signal
-                .as_ref()
-                .map(|c| (p.id.clone(), c.clone()))
-        })
+        .filter_map(|p| p.clock_signal.as_ref().map(|c| (p.id.clone(), c.clone())))
         .collect();
     // Reuse already-populated inst.clocks (set by
     // reattribute_clock_domains).
@@ -843,7 +879,8 @@ pub(crate) fn recompute_cdc_flags(df: &mut DataFlow, resolver: &dyn ClockPinReso
                 EndpointKind::Process => {
                     if let Some(cell) = ep.cell_id.as_deref() {
                         if let Some(sink_clk) = proc_clock.get(cell) {
-                            if sink_clk != &domain {
+                            // A process clocked by this net reads it as its clock, not as data.
+                            if sink_clk != &domain && sink_clk != &net.name {
                                 net.is_cdc = true;
                                 break;
                             }
@@ -968,10 +1005,7 @@ fn signal_ids_in_region(region: &Region<'_>) -> HashSet<EntityId> {
 fn port_id_in_region(region: &Region<'_>, name: &str) -> Option<EntityId> {
     region
         .immediates()
-        .filter(|ent| matches!(
-            ent.actual_kind(),
-            AnyEntKind::Object(_)
-        ))
+        .filter(|ent| matches!(ent.actual_kind(), AnyEntKind::Object(_)))
         .find(|ent| match ent.designator() {
             Designator::Identifier(s) => s.name_utf8() == name,
             _ => false,
@@ -1218,8 +1252,7 @@ impl Searcher for ProcessCollector {
     fn search_decl(&mut self, ctx: &dyn TokenAccess, decl: FoundDeclaration<'_>) -> SearchState {
         if let DeclarationItem::ConcurrentStatement(labeled) = decl.ast {
             if let ConcurrentStatement::Process(ref proc) = labeled.statement.item {
-                self.processes
-                    .push(build_raw_process(ctx, labeled, proc));
+                self.processes.push(build_raw_process(ctx, labeled, proc));
             }
         }
         NotFinished
@@ -1278,7 +1311,10 @@ fn build_raw_process(
 
 fn dedup_preserve_order(items: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
-    items.into_iter().filter(|s| seen.insert(s.clone())).collect()
+    items
+        .into_iter()
+        .filter(|s| seen.insert(s.clone()))
+        .collect()
 }
 
 fn walk_sequential_statements(
@@ -1475,9 +1511,7 @@ fn walk_call_or_indexed(
     let func_name = simple_name_text(&call.name.item);
     if let Some(name) = &func_name {
         let lower = name.to_ascii_lowercase();
-        if (lower == "rising_edge" || lower == "falling_edge")
-            && clock_signal.is_none()
-        {
+        if (lower == "rising_edge" || lower == "falling_edge") && clock_signal.is_none() {
             // First parameter's actual is the clock signal.
             if let Some(first) = call.parameters.items.first() {
                 if let crate::ast::ActualPart::Expression(expr) = &first.actual.item {
@@ -1531,5 +1565,78 @@ fn simple_name_text(name: &Name) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(kind: EndpointKind, cell: &str, port: &str, direction: PortDirection) -> Endpoint {
+        Endpoint {
+            kind,
+            cell_id: Some(cell.to_owned()),
+            port: port.to_owned(),
+            direction,
+            source_pos: None,
+        }
+    }
+
+    fn process(id: &str, clock: &str) -> ProcessInfo {
+        ProcessInfo {
+            id: id.to_owned(),
+            label: None,
+            source_pos: None,
+            sensitivity: Sensitivity::All,
+            clock_signal: Some(clock.to_owned()),
+            reset_signal: None,
+            writes: vec![],
+            reads: vec![],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn clock_net_is_not_a_crossing_into_the_process_it_clocks() {
+        let mut df = DataFlow {
+            entity_path: "lib.top".to_owned(),
+            architecture: None,
+            entity_pos: None,
+            external_ports: vec![],
+            instances: vec![],
+            processes: vec![process("clocked", "clk"), process("other", "clk2")],
+            nets: vec![
+                NetInfo {
+                    name: "clk".to_owned(),
+                    kind: NetKind::Signal,
+                    endpoints: vec![endpoint(
+                        EndpointKind::Process,
+                        "clocked",
+                        "clk",
+                        PortDirection::In,
+                    )],
+                    clock_domain: Some("refclk".to_owned()),
+                    is_cdc: false,
+                },
+                NetInfo {
+                    name: "data".to_owned(),
+                    kind: NetKind::Signal,
+                    endpoints: vec![endpoint(
+                        EndpointKind::Process,
+                        "other",
+                        "data",
+                        PortDirection::In,
+                    )],
+                    clock_domain: Some("clk".to_owned()),
+                    is_cdc: false,
+                },
+            ],
+            notes: vec![],
+        };
+
+        recompute_cdc_flags(&mut df, &HeuristicClockPins);
+
+        assert!(!df.nets[0].is_cdc);
+        assert!(df.nets[1].is_cdc);
     }
 }

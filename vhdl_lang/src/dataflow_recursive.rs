@@ -133,7 +133,8 @@ fn compute_with_cache(
 }
 
 fn split_entity_path(path: &str) -> Option<(&str, &str)> {
-    path.split_once('.').filter(|(l, e)| !l.is_empty() && !e.is_empty())
+    path.split_once('.')
+        .filter(|(l, e)| !l.is_empty() && !e.is_empty())
 }
 
 fn reset_attribution(df: &mut DataFlow) {
@@ -186,14 +187,11 @@ fn propagate_leaf_output_domains(
 
     // For each instance, build a leaf-port-name -> parent-clock-net map
     // (only for the leaf's clock pins).
-    let mut inst_clock_pin_to_parent_net: HashMap<String, HashMap<String, String>> =
-        HashMap::new();
+    let mut inst_clock_pin_to_parent_net: HashMap<String, HashMap<String, String>> = HashMap::new();
     for (inst_id, pins) in clock_pins {
         let mut m: HashMap<String, String> = HashMap::new();
         for pin in pins {
-            if let Some(parent_net) =
-                inst_pin_to_parent_net.get(&(inst_id.clone(), pin.clone()))
-            {
+            if let Some(parent_net) = inst_pin_to_parent_net.get(&(inst_id.clone(), pin.clone())) {
                 m.insert(pin.clone(), parent_net.clone());
             }
         }

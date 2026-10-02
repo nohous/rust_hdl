@@ -138,13 +138,12 @@ pub fn compute_design_hierarchy(
         })?;
 
     let ent_sym = root.symbol_utf8(entity_name);
-    let top_ent = find_entity(root, library, &ent_sym).ok_or_else(|| {
-        HierarchyError::UnknownEntity {
+    let top_ent =
+        find_entity(root, library, &ent_sym).ok_or_else(|| HierarchyError::UnknownEntity {
             library: library_name.to_string(),
             entity: entity_name.to_string(),
             known: known_entities(root, library),
-        }
-    })?;
+        })?;
 
     let mut visiting: HashSet<EntityId> = HashSet::new();
     Ok(walk_entity(
@@ -187,11 +186,7 @@ fn known_entities(root: &DesignRoot, library: &Library) -> Vec<String> {
     names
 }
 
-fn find_entity<'a>(
-    root: &'a DesignRoot,
-    library: &Library,
-    entity: &Symbol,
-) -> Option<EntRef<'a>> {
+fn find_entity<'a>(root: &'a DesignRoot, library: &Library, entity: &Symbol) -> Option<EntRef<'a>> {
     for locked in library.units() {
         let data = locked.unit.expect_analyzed();
         let AnyDesignUnit::Primary(ref primary) = *data.deref() else {
@@ -323,17 +318,15 @@ fn resolve_instance<'a>(
         target_kind,
     } = raw;
 
-    let unresolved = |label: Option<String>, kind: HierarchyKind, note: &str| {
-        DesignHierarchyNode {
-            label,
-            entity_path: "<unresolved>".into(),
-            architecture: None,
-            kind,
-            instance_pos: Some(instance_pos.clone()),
-            entity_pos: None,
-            children: Vec::new(),
-            notes: vec![note.into()],
-        }
+    let unresolved = |label: Option<String>, kind: HierarchyKind, note: &str| DesignHierarchyNode {
+        label,
+        entity_path: "<unresolved>".into(),
+        architecture: None,
+        kind,
+        instance_pos: Some(instance_pos.clone()),
+        entity_pos: None,
+        children: Vec::new(),
+        notes: vec![note.into()],
     };
 
     let Some(id) = target_id else {

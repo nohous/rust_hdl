@@ -34,9 +34,6 @@ pub struct Group {
 enum HierarchyFormat {
     Text,
     Json,
-    /// Yosys-style JSON, the format consumed by netlistsvg. Only valid
-    /// for `--dataflow`.
-    Yosys,
 }
 
 /// Run vhdl analysis
@@ -251,10 +248,6 @@ fn run_hierarchy(
             let out = match fmt {
                 HierarchyFormat::Text => format_hierarchy_text(&node),
                 HierarchyFormat::Json => format_hierarchy_json(&node),
-                HierarchyFormat::Yosys => {
-                    eprintln!("yosys format is only valid for --dataflow");
-                    std::process::exit(1);
-                }
             };
             print!("{out}");
             std::process::exit(0);
@@ -348,7 +341,6 @@ fn run_dataflow(
             let out = match fmt {
                 HierarchyFormat::Text => format_dataflow_text(&df),
                 HierarchyFormat::Json => format_dataflow_json(&df),
-                HierarchyFormat::Yosys => format_dataflow_yosys(&df),
             };
             print!("{out}");
             std::process::exit(0);
@@ -475,7 +467,13 @@ fn format_dataflow_text(df: &DataFlow) -> String {
                         ep.cell_id.clone().unwrap_or_default()
                     }
                 };
-                let _ = writeln!(out, "    {}.{}  ({})", target, ep.port, direction_str(ep.direction));
+                let _ = writeln!(
+                    out,
+                    "    {}.{}  ({})",
+                    target,
+                    ep.port,
+                    direction_str(ep.direction)
+                );
             }
         }
     }
@@ -494,205 +492,9 @@ fn direction_str(d: PortDirection) -> &'static str {
 }
 
 fn format_dataflow_json(df: &DataFlow) -> String {
-    let ser = ser_dataflow::SerDataFlow::from(df);
-    let mut s = serde_json::to_string_pretty(&ser).expect("serialize dataflow");
+    let mut s = serde_json::to_string_pretty(df).expect("serialize dataflow");
     s.push('\n');
     s
-}
-
-fn format_dataflow_yosys(df: &DataFlow) -> String {
-    vhdl_lang::format_yosys_string(df)
-}
-
-
-mod ser_dataflow {
-    use super::{format_pos, DataFlow, EndpointKind, NetKind, PortDirection};
-    use serde::Serialize;
-    use vhdl_lang::{Endpoint, InstanceInfo, NetInfo, PortInfo, ProcessInfo, Sensitivity};
-
-    #[derive(Serialize)]
-    pub struct SerDataFlow<'a> {
-        entity: &'a str,
-        architecture: Option<&'a str>,
-        entity_pos: Option<String>,
-        external_ports: Vec<SerPort<'a>>,
-        instances: Vec<SerInstance<'a>>,
-        processes: Vec<SerProcess<'a>>,
-        nets: Vec<SerNet<'a>>,
-        notes: &'a [String],
-    }
-
-    impl<'a> From<&'a DataFlow> for SerDataFlow<'a> {
-        fn from(df: &'a DataFlow) -> Self {
-            SerDataFlow {
-                entity: &df.entity_path,
-                architecture: df.architecture.as_deref(),
-                entity_pos: df.entity_pos.as_ref().map(format_pos),
-                external_ports: df.external_ports.iter().map(SerPort::from).collect(),
-                instances: df.instances.iter().map(SerInstance::from).collect(),
-                processes: df.processes.iter().map(SerProcess::from).collect(),
-                nets: df.nets.iter().map(SerNet::from).collect(),
-                notes: &df.notes,
-            }
-        }
-    }
-
-    #[derive(Serialize)]
-    struct SerProcess<'a> {
-        id: &'a str,
-        label: Option<&'a str>,
-        source_pos: Option<String>,
-        sensitivity: SerSensitivity<'a>,
-        clock_signal: Option<&'a str>,
-        reset_signal: Option<&'a str>,
-        reads: &'a [String],
-        writes: &'a [String],
-        notes: &'a [String],
-    }
-
-    impl<'a> From<&'a ProcessInfo> for SerProcess<'a> {
-        fn from(p: &'a ProcessInfo) -> Self {
-            SerProcess {
-                id: &p.id,
-                label: p.label.as_deref(),
-                source_pos: p.source_pos.as_ref().map(format_pos),
-                sensitivity: match &p.sensitivity {
-                    Sensitivity::Names(names) => SerSensitivity {
-                        kind: "names",
-                        names: Some(names),
-                    },
-                    Sensitivity::All => SerSensitivity {
-                        kind: "all",
-                        names: None,
-                    },
-                    Sensitivity::Implicit => SerSensitivity {
-                        kind: "implicit",
-                        names: None,
-                    },
-                },
-                clock_signal: p.clock_signal.as_deref(),
-                reset_signal: p.reset_signal.as_deref(),
-                reads: &p.reads,
-                writes: &p.writes,
-                notes: &p.notes,
-            }
-        }
-    }
-
-    #[derive(Serialize)]
-    struct SerSensitivity<'a> {
-        kind: &'static str,
-        names: Option<&'a [String]>,
-    }
-
-    #[derive(Serialize)]
-    struct SerPort<'a> {
-        name: &'a str,
-        direction: &'static str,
-        type_repr: &'a str,
-        decl_pos: Option<String>,
-    }
-
-    impl<'a> From<&'a PortInfo> for SerPort<'a> {
-        fn from(p: &'a PortInfo) -> Self {
-            SerPort {
-                name: &p.name,
-                direction: dir(p.direction),
-                type_repr: &p.type_repr,
-                decl_pos: p.decl_pos.as_ref().map(format_pos),
-            }
-        }
-    }
-
-    #[derive(Serialize)]
-    struct SerInstance<'a> {
-        id: &'a str,
-        label: Option<&'a str>,
-        entity: &'a str,
-        instance_pos: Option<String>,
-        entity_pos: Option<String>,
-        ports: Vec<SerPort<'a>>,
-        notes: &'a [String],
-        clocks: &'a [String],
-    }
-
-    impl<'a> From<&'a InstanceInfo> for SerInstance<'a> {
-        fn from(i: &'a InstanceInfo) -> Self {
-            SerInstance {
-                id: &i.id,
-                label: i.label.as_deref(),
-                entity: &i.entity_path,
-                instance_pos: i.instance_pos.as_ref().map(format_pos),
-                entity_pos: i.entity_pos.as_ref().map(format_pos),
-                ports: i.ports.iter().map(SerPort::from).collect(),
-                notes: &i.notes,
-                clocks: &i.clocks,
-            }
-        }
-    }
-
-    #[derive(Serialize)]
-    struct SerNet<'a> {
-        name: &'a str,
-        kind: &'static str,
-        endpoints: Vec<SerEndpoint<'a>>,
-        clock_domain: Option<&'a str>,
-        is_cdc: bool,
-    }
-
-    impl<'a> From<&'a NetInfo> for SerNet<'a> {
-        fn from(n: &'a NetInfo) -> Self {
-            SerNet {
-                name: &n.name,
-                kind: net_kind(n.kind),
-                endpoints: n.endpoints.iter().map(SerEndpoint::from).collect(),
-                clock_domain: n.clock_domain.as_deref(),
-                is_cdc: n.is_cdc,
-            }
-        }
-    }
-
-    #[derive(Serialize)]
-    struct SerEndpoint<'a> {
-        kind: &'static str,
-        cell_id: Option<&'a str>,
-        port: &'a str,
-        direction: &'static str,
-    }
-
-    impl<'a> From<&'a Endpoint> for SerEndpoint<'a> {
-        fn from(e: &'a Endpoint) -> Self {
-            SerEndpoint {
-                kind: match e.kind {
-                    EndpointKind::External => "external",
-                    EndpointKind::Instance => "instance",
-                    EndpointKind::Process => "process",
-                },
-                cell_id: e.cell_id.as_deref(),
-                port: &e.port,
-                direction: dir(e.direction),
-            }
-        }
-    }
-
-    fn dir(d: PortDirection) -> &'static str {
-        match d {
-            PortDirection::In => "in",
-            PortDirection::Out => "out",
-            PortDirection::Inout => "inout",
-            PortDirection::Buffer => "buffer",
-            PortDirection::Linkage => "linkage",
-            PortDirection::Unknown => "unknown",
-        }
-    }
-
-    fn net_kind(k: NetKind) -> &'static str {
-        match k {
-            NetKind::Signal => "signal",
-            NetKind::ParentPort => "parentPort",
-            NetKind::Opaque => "opaque",
-        }
-    }
 }
 
 // --- Hierarchy text & JSON rendering -----------------------------------------
@@ -742,10 +544,7 @@ fn write_text(
     }
     out.push('\n');
 
-    let note_prefix = format!(
-        "{prefix}{}",
-        if is_root || is_last { "   " } else { "|  " }
-    );
+    let note_prefix = format!("{prefix}{}", if is_root || is_last { "   " } else { "|  " });
     for note in &node.notes {
         let _ = writeln!(out, "{note_prefix}# {note}");
     }

@@ -5,9 +5,8 @@
 //! Custom LSP request `vhdl/dataFlow`.
 //!
 //! Given a `library.entity`, returns the architecture's data-flow
-//! graph as a Yosys-style JSON payload (the same format the
-//! `vhdl_lang --dataflow-format yosys` CLI produces). The client uses
-//! it to render a schematic in a webview.
+//! graph ([`vhdl_lang::DataFlow`] serialized as JSON). The client
+//! renders it as a schematic in a webview.
 
 use serde::Deserialize;
 
@@ -22,13 +21,10 @@ pub struct DataFlowParams {
 }
 
 impl VHDLServer {
-    pub fn data_flow(
-        &self,
-        params: &DataFlowParams,
-    ) -> Result<serde_json::Value, HierarchyError> {
+    pub fn data_flow(&self, params: &DataFlowParams) -> Result<serde_json::Value, HierarchyError> {
         let df = self
             .project
             .data_flow_recursive(&params.library, &params.entity)?;
-        Ok(vhdl_lang::format_yosys(&df))
+        Ok(serde_json::to_value(&df).expect("serialize dataflow"))
     }
 }

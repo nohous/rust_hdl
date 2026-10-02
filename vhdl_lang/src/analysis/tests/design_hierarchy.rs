@@ -51,10 +51,16 @@ end architecture;
     assert_eq!(tree.architecture.as_deref(), Some("rtl"));
     assert_eq!(tree.kind, HierarchyKind::Top);
 
-    assert_eq!(child_summary(&tree), vec![("middle_inst".into(), "lib.middle".into())]);
+    assert_eq!(
+        child_summary(&tree),
+        vec![("middle_inst".into(), "lib.middle".into())]
+    );
     let middle = &tree.children[0];
     assert_eq!(middle.kind, HierarchyKind::DirectEntity);
-    assert_eq!(child_summary(middle), vec![("leaf_inst".into(), "lib.leaf".into())]);
+    assert_eq!(
+        child_summary(middle),
+        vec![("leaf_inst".into(), "lib.leaf".into())]
+    );
 
     let leaf = &middle.children[0];
     assert!(leaf.children.is_empty());
@@ -89,7 +95,10 @@ end architecture;
     let child = &tree.children[0];
     assert_eq!(child.kind, HierarchyKind::BoundComponent);
     assert_eq!(child.entity_path, "lib.leaf");
-    assert!(child.notes.is_empty(), "bound component should have no warnings");
+    assert!(
+        child.notes.is_empty(),
+        "bound component should have no warnings"
+    );
 }
 
 #[test]
@@ -297,9 +306,6 @@ architecture rtl of orphan is begin end architecture;
     assert_eq!(leaf.instance_count, 1);
 
     // Order: roots first (deepest first), then non-roots (deepest first).
-    let order: Vec<&str> = candidates
-        .iter()
-        .map(|c| c.entity.as_str())
-        .collect();
+    let order: Vec<&str> = candidates.iter().map(|c| c.entity.as_str()).collect();
     assert_eq!(order, vec!["top", "orphan", "middle", "leaf"]);
 }
